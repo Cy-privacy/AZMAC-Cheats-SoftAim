@@ -17,11 +17,21 @@ def initialize_pygame_and_controller():
 
 
 def get_left_trigger(controller):
-    return (
-        controller.get_axis(4) + 1
-    ) / 2  # Normalize to 0 (unpressed) to 1 (fully pressed)
+    if controller is None:
+        return 0
+    try:
+        return (
+            controller.get_axis(4) + 1
+        ) / 2  # Normalize to 0 (unpressed) to 1 (fully pressed)
+    except:
+        return 0
 
 def get_right_trigger(controller):
-    return (
-        controller.get_axis(5) + 1
-    ) / 2  # Normalize to 0 (unpressed) to 1 (fully pressed)
+    if controller is None:
+        return 0
+    try:
+        return (
+            controller.get_axis(5) + 1
+        ) / 2  # Normalize to 0 (unpressed) to 1 (fully pressed)
+    except:
+        return 0

@@ -2,7 +2,6 @@ import customtkinter as ctk
 import sv_ttk
 import cv2
 from PIL import Image, ImageTk, ImageDraw
-from .components import create_checkboxes, create_sliders, create_comboboxes, create_buttons, create_labels
 import numpy as np
 import win32gui
 import win32con
@@ -86,10 +85,10 @@ class MainWindow:
         # Checkboxes
         checkbox_frame = ctk.CTkFrame(left_column)
         checkbox_frame.pack(fill="x", pady=10)
-        self.checkboxes = create_checkboxes(checkbox_frame, self.config_manager, self.update_setting)
+        self.checkboxes = self.create_checkboxes(checkbox_frame)
 
         # FPS Label
-        self.fps_label = create_labels(left_column)['fps']
+        self.fps_label = ctk.CTkLabel(left_column, text="FPS: 0")
         self.fps_label.pack(pady=5)
 
         # FOV controls
@@ -128,7 +127,7 @@ class MainWindow:
             ("fov_size", "FOV Size", 0, 200),
         ]
         
-        self.main_sliders = create_sliders(main_slider_frame, self.config_manager, self.update_setting, main_slider_configs)
+        self.main_sliders = self.create_sliders(main_slider_frame, main_slider_configs)
 
         # Key bindings
         key_frame = ctk.CTkFrame(left_column)
@@ -162,7 +161,6 @@ class MainWindow:
         additional_slider_frame.pack(fill="x", pady=10)
         
         additional_slider_configs = [
-            ("smoothing_factor", "Smoothing factor", 0, 100),
             ("recoil_strength", "Recoil control strength", 0, 100),
             ("aim_shake_strength", "Aim shake strength", 0, 100),
             ("max_move", "Max move speed", 0, 100),
@@ -170,19 +168,14 @@ class MainWindow:
             ("mask_height", "Mask height", 0, 640),
         ]
         
-        self.additional_sliders = create_sliders(additional_slider_frame, self.config_manager, self.update_setting, additional_slider_configs)
-
-        # Comboboxes
-        combo_frame = ctk.CTkFrame(settings_frame)
-        combo_frame.pack(fill="x", pady=10)
-        self.comboboxes = create_comboboxes(combo_frame, self.config_manager, self.config_manager.update_setting)
+        self.additional_sliders = self.create_sliders(additional_slider_frame, additional_slider_configs)
 
     def setup_advanced_tab(self):
         advanced_frame = ctk.CTkFrame(self.tab_advanced)
         advanced_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         # Buttons
-        self.buttons = create_buttons(advanced_frame, self)
+        self.buttons = self.create_buttons(advanced_frame)
 
     def toggle_theme(self):
         current_theme = sv_ttk.get_theme()
@@ -333,3 +326,100 @@ class MainWindow:
 
     def run(self):
         self.root.mainloop()
+        
+    def on_closing(self):
+        self.running = False
+        self.root.quit()
+        self.root.destroy()
+        
+    def toggle_auto_aim(self):
+        current = self.config_manager.get_setting("auto_aim")
+        self.config_manager.update_setting("auto_aim", not current)
+        
+    def update_overlay(self, coordinates):
+        # This would be implemented to update any overlay visualization
+        pass
+        
+    def create_checkboxes(self, root):
+        checkboxes = {}
+        checkbox_configs = [
+            ("auto_aim", "Auto aim"),
+            ("trigger_bot", "Trigger bot"),
+            ("preview", "Preview"),
+            ("recoil", "Recoil control"),
+            ("aim_shake", "Aim shake"),
+            ("overlay", "Overlay"),
+            ("mask_left", "Mask left"),
+            ("mask_right", "Mask right"),
+        ]
+
+        for i, (key, text) in enumerate(checkbox_configs):
+            var = ctk.BooleanVar(value=self.config_manager.get_setting(key))
+            checkbox = ctk.CTkCheckBox(
+                root,
+                text=text,
+                variable=var,
+                command=lambda k=key, v=var: self.update_setting(k, v.get()),
+            )
+            checkbox.grid(row=i//3, column=i%3, padx=5, pady=2, sticky="w")
+            checkboxes[key] = checkbox
+
+        return checkboxes
+        
+    def create_sliders(self, root, slider_configs=None):
+        sliders = {}
+        if slider_configs is None:
+            slider_configs = [
+                ("sensitivity", "Sensitivity", 0, 100),
+                ("confidence", "Confidence threshold", 0, 100),
+                ("headshot", "Headshot offset", 0, 100),
+                ("trigger_bot_distance", "Trigger bot distance", 0, 100),
+                ("recoil_strength", "Recoil control strength", 0, 100),
+                ("aim_shake_strength", "Aim shake strength", 0, 100),
+                ("max_move", "Max move speed", 0, 100),
+                ("mask_width", "Mask width", 0, 640),
+                ("mask_height", "Mask height", 0, 640),
+                ("fov_size", "FOV Size", 0, 200),
+            ]
+
+        for i, (key, text, from_, to) in enumerate(slider_configs):
+            frame = ctk.CTkFrame(root)
+            frame.pack(fill="x", padx=10, pady=5)
+            
+            current_value = self.config_manager.get_setting(key)
+            if not isinstance(current_value, (int, float)):
+                current_value = (from_ + to) // 2
+                self.config_manager.update_setting(key, current_value)
+            
+            label = ctk.CTkLabel(frame, text=f"{text}: {current_value:.1f}")
+            label.pack(side="left")
+            
+            slider = ctk.CTkSlider(
+                frame,
+                from_=from_,
+                to=to,
+                command=lambda value, k=key, l=label, t=text: self.slider_event(value, k, l, t),
+            )
+            slider.set(current_value)
+            slider.pack(side="right", expand=True, fill="x", padx=10)
+            sliders[key] = slider
+
+        return sliders
+
+    def slider_event(self, value, key, label, text):
+        rounded_value = round(float(value), 1)
+        label.configure(text=f"{text}: {rounded_value:.1f}")
+        self.update_setting(key, rounded_value)
+        
+    def create_buttons(self, root):
+        buttons = {}
+        
+        reload_button = ctk.CTkButton(root, text="Reload model", command=self.reload_model)
+        reload_button.pack(pady=10)
+        buttons['reload'] = reload_button
+        
+        keybindings_button = ctk.CTkButton(root, text="Configure keybindings", command=self.show_keybindings)
+        keybindings_button.pack(pady=10)
+        buttons['keybindings'] = keybindings_button
+        
+        return buttons

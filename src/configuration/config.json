@@ -53,13 +53,5 @@
     "aimShakey": false,
     "aimShakeyStrength": 5,
     "toggleable": false,
-    "gameTitle": "Fortnite",
-    "fov_enabled": "on",
-    "fov_size": 140,
-    "fov": "on",
-    "show_fov": true,
-    "fps": 165,
-    "smoothing_factor": 0.0,
-    "confidence_threshold": 0.6,
-    "recoil_control": "off"
+    "gameTitle": "Fortnite"
 }
