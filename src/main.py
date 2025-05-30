@@ -3,23 +3,98 @@ import os
 import random
 import sys
 import time
+from copy import deepcopy
+from pathlib import Path
 
-import mss
-import numba
 import numpy as np
-import pygame
-import serial
-import serial.tools.list_ports
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+import yaml
+from torch.optim import lr_scheduler
+from tqdm import tqdm
+
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[1]  # YOLOv5 root directory
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))  # add ROOT to PATH
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+
+import segment.val as validate  # for end-of-epoch mAP
+from models.experimental import attempt_load
+from models.yolo import SegmentationModel
+from utils.autoanchor import check_anchors
+from utils.autobatch import check_train_batch_size
+from utils.callbacks import Callbacks
+from utils.downloads import attempt_download, is_url
+from utils.general import (
+    LOGGER,
+    TQDM_BAR_FORMAT,
+    check_amp,
+    check_dataset,
+    check_file,
+    check_git_info,
+    check_git_status,
+    check_img_size,
+    check_requirements,
+    check_suffix,
+    check_yaml,
+    colorstr,
+    get_latest_run,
+    increment_path,
+    init_seeds,
+    intersect_dicts,
+    labels_to_class_weights,
+    labels_to_image_weights,
+    one_cycle,
+    print_args,
+    print_mutation,
+    strip_optimizer,
+    yaml_save,
+)
+from utils.loggers import GenericLogger
+from utils.plots import plot_evolve, plot_labels
+from utils.segment.dataloaders import create_dataloader
+from utils.segment.loss import ComputeLoss
+from utils.segment.metrics import KEYS, fitness
+from utils.segment.plots import plot_images_and_masks, plot_results_with_masks
+from utils.torch_utils import (
+    EarlyStopping,
+    ModelEMA,
+    de_parallel,
+    select_device,
+    smart_DDP,
+    smart_optimizer,
+    smart_resume,
+    torch_distributed_zero_first,
+)
+
+LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))  # https://pytorch.org/docs/stable/elastic/run.html
+RANK = int(os.getenv("RANK", -1))
+WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
+GIT_INFO = check_git_info()
+
+import cv2
+import mss
+import numpy as np
 import torch
 import win32api
 from colorama import Fore, Style
 from line_profiler import profile
 
-from controller_setup import initialize_pygame_and_controller, get_left_trigger, get_right_trigger
-from core.send_targets import send_targets
-from gui.main_window import MainWindow
-from spawn_utils.config_manager import ConfigManager
-from spawn_utils.yolo_handler import YOLOHandler
+try:
+    from controller_setup import initialize_pygame_and_controller, get_left_trigger, get_right_trigger
+    from core.send_targets import send_targets
+    from gui.main_window import MainWindow
+    from spawn_utils.config_manager import ConfigManager
+    from spawn_utils.yolo_handler import YOLOHandler
+except ImportError:
+    # Try relative imports if the above fails
+    from .controller_setup import initialize_pygame_and_controller, get_left_trigger, get_right_trigger
+    from .core.send_targets import send_targets
+    from .gui.main_window import MainWindow
+    from .spawn_utils.config_manager import ConfigManager
+    from .spawn_utils.yolo_handler import YOLOHandler
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -36,7 +111,7 @@ MODELS_PATH = os.path.join(SCRIPT_DIR, "models")
 screen = None
 random_x, random_y, arduino = 0, 0, None
 
-@numba.jit(nopython=True)
+@profile
 def calculate_targets_numba(boxes, width, height, headshot_percent):
     width_half = width / 2
     height_half = height / 2
@@ -80,7 +155,7 @@ def get_keycode(key):
 def update_aim_shake():
     """Updates random aim shake offsets."""
     global random_x, random_y
-    if config_manager.get_setting("aim_shake") == "on":
+    if config_manager.get_setting("aim_shake"):
         aim_shake_strength = int(config_manager.get_setting("aim_shake_strength"))
         random_x = random.randint(-aim_shake_strength, aim_shake_strength)
         random_y = random.randint(-aim_shake_strength, aim_shake_strength)
@@ -90,13 +165,13 @@ def update_aim_shake():
 
 def mask_frame(frame):
     """Masks out specified regions of the frame."""
-    if config_manager.get_setting("mask_left") == "on":
+    if config_manager.get_setting("mask_left"):
         frame[
             int(config_manager.get_setting("height") - config_manager.get_setting("mask_height")) : config_manager.get_setting("height"),
             0 : int(config_manager.get_setting("mask_width")),
             :,
         ] = 0
-    if config_manager.get_setting("mask_right") == "on":
+    if config_manager.get_setting("mask_right"):
         frame[
             int(config_manager.get_setting("height") - config_manager.get_setting("mask_height")) : config_manager.get_setting("height"),
             int(config_manager.get_setting("width") - config_manager.get_setting("mask_width")) : config_manager.get_setting("width"),
@@ -111,7 +186,13 @@ def initialize_game_window():
     right = left + config_manager.get_setting("width")
     bottom = top + config_manager.get_setting("height")
 
-    screen = mss.mss()
+    try:
+        screen = mss.mss()
+    except Exception as e:
+        print(f"Error initializing mss: {e}")
+        # Fallback to OpenCV for screen capture
+        screen = None
+        
     return {"top": top, "left": left, "width": config_manager.get_setting("width"), "height": config_manager.get_setting("height")}
 
 @profile
@@ -136,7 +217,7 @@ def process_detections(detections):
             )
             coordinates = boxes
 
-    if config_manager.get_setting("fov_enabled") == "on":
+    if config_manager.get_setting("fov_enabled"):
         fov_size = config_manager.get_setting("fov_size")
         fov_mask = np.sum(targets**2, axis=1) <= fov_size**2
         targets = targets[fov_mask]
@@ -144,6 +225,31 @@ def process_detections(detections):
         coordinates = coordinates[fov_mask]
 
     return targets, distances, coordinates
+
+def capture_screen(monitor):
+    """Capture screen using either mss or OpenCV as fallback"""
+    global screen
+    
+    if screen is not None:
+        # Use mss if available
+        try:
+            return np.array(screen.grab(monitor))
+        except Exception as e:
+            print(f"Error with mss screen capture: {e}")
+            screen = None  # Fall back to OpenCV
+    
+    # Fallback to OpenCV
+    try:
+        x, y, w, h = monitor["left"], monitor["top"], monitor["width"], monitor["height"]
+        # Use OpenCV to capture screen
+        import cv2
+        hwnd = None  # 0 for the entire screen
+        screen_img = np.array(cv2.captureWindow(hwnd))
+        return screen_img[y:y+h, x:x+w]
+    except Exception as e:
+        print(f"Error with OpenCV screen capture: {e}")
+        # Return a blank frame as last resort
+        return np.zeros((monitor["height"], monitor["width"], 3), dtype=np.uint8)
 
 @profile
 def main_loop(controller, main_window, yolo_handler, monitor):
@@ -157,7 +263,11 @@ def main_loop(controller, main_window, yolo_handler, monitor):
         loop_start = time.time()
 
         frame_count += 1
-        np_frame = preprocess_frame(np.array(screen.grab(monitor)))
+        
+        # Capture screen
+        np_frame = capture_screen(monitor)
+        np_frame = preprocess_frame(np_frame)
+        
         pygame.event.pump()
 
         if np_frame.shape[2] == 4:
@@ -181,7 +291,7 @@ def main_loop(controller, main_window, yolo_handler, monitor):
 
         main_window.update_preview(np_frame, coordinates, targets, distances)
 
-        if config_manager.get_setting("overlay") == "on":
+        if config_manager.get_setting("overlay"):
            main_window.update_overlay(coordinates)
 
         elapsed_time = time.time() - start_time
@@ -191,7 +301,7 @@ def main_loop(controller, main_window, yolo_handler, monitor):
            start_time = time.time()
            update_aim_shake()
 
-        if config_manager.get_setting("toggle") == "on":
+        if config_manager.get_setting("toggle"):
            trigger_value = get_left_trigger(controller)
            if trigger_value > 0.5 and not pressing:
                pressing = True
@@ -251,10 +361,18 @@ def main(**argv):
         launcher_settings = json.load(f)
 
     # Detect available serial ports
-    ports = [port[0] for port in serial.tools.list_ports.comports()]
-    default_port = next(
-        (port[0] for port in ports if "Arduino" in port[1]), "COM1"
-    )
+    ports = []
+    try:
+        import serial.tools.list_ports
+        ports = [port[0] for port in serial.tools.list_ports.comports()]
+    except:
+        ports = ["COM1"]  # Default if serial not available
+        
+    default_port = "COM1"  # Default if no Arduino port found
+    for port in ports:
+        if "Arduino" in port:
+            default_port = port
+            break
 
     # Initialize Pygame and controller
     controller = initialize_pygame_and_controller()
@@ -264,15 +382,15 @@ def main(**argv):
     quit_key = get_keycode(launcher_settings["quitKey"])
 
     # Initialize settings from launcher settings
-    config_manager.update_setting("auto_aim", "on")
-    config_manager.update_setting("trigger_bot", "on" if launcher_settings["autoFire"] else "off")
-    config_manager.update_setting("toggle", "on" if launcher_settings["toggleable"] else "off")
-    config_manager.update_setting("recoil", "off")
-    config_manager.update_setting("aim_shake", "on" if launcher_settings["aimShakey"] else "off")
-    config_manager.update_setting("overlay", "off")
-    config_manager.update_setting("preview", "on" if launcher_settings["visuals"] else "off")
-    config_manager.update_setting("mask_left", "on" if launcher_settings["maskLeft"] and launcher_settings["useMask"] else "off")
-    config_manager.update_setting("mask_right", "on" if not launcher_settings["maskLeft"] and launcher_settings["useMask"] else "off")
+    config_manager.update_setting("auto_aim", True)
+    config_manager.update_setting("trigger_bot", True if launcher_settings["autoFire"] else False)
+    config_manager.update_setting("toggle", True if launcher_settings["toggleable"] else False)
+    config_manager.update_setting("recoil", False)
+    config_manager.update_setting("aim_shake", True if launcher_settings["aimShakey"] else False)
+    config_manager.update_setting("overlay", False)
+    config_manager.update_setting("preview", True if launcher_settings["visuals"] else False)
+    config_manager.update_setting("mask_left", True if launcher_settings["maskLeft"] and launcher_settings["useMask"] else False)
+    config_manager.update_setting("mask_right", True if not launcher_settings["maskLeft"] and launcher_settings["useMask"] else False)
     config_manager.update_setting("sensitivity", launcher_settings["movementAmp"] * 100)
     config_manager.update_setting("headshot", launcher_settings["headshotDistanceModifier"] * 100 if launcher_settings["headshotMode"] else 40)
     config_manager.update_setting("trigger_bot_distance", launcher_settings["autoFireActivationDistance"])
@@ -294,7 +412,7 @@ def main(**argv):
     config_manager.update_setting("quit_key_string", launcher_settings["quitKey"])
     config_manager.update_setting("mouse_input", "default")
     config_manager.update_setting("arduino", default_port)
-    config_manager.update_setting("fov_enabled", "on" if launcher_settings["fovToggle"] else "off")
+    config_manager.update_setting("fov_enabled", True if launcher_settings["fovToggle"] else False)
     config_manager.update_setting("fov_size", launcher_settings["fovSize"])
 
     # Create main window
@@ -303,7 +421,7 @@ def main(**argv):
     # Initialize YOLOHandler
     yolo_handler = YOLOHandler(config_manager, MODELS_PATH)
 
-    if config_manager.get_setting("overlay") == "on":
+    if config_manager.get_setting("overlay"):
         main_window.toggle_overlay()
 
     try:
